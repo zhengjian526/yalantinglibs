@@ -1,5 +1,7 @@
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+include_directories(msgpack-cxx-4.1.2/include)
+add_definitions(-DMSGPACK_NO_BOOST=ON)
 set(TEST_SRCS
         test_async_rpc_server.cpp
         test_coro_rpc_server.cpp

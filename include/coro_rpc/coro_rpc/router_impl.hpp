@@ -16,6 +16,7 @@
 #pragma once
 #include <functional>
 #include <memory>
+#include <msgpack.hpp>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -33,9 +34,9 @@ namespace coro_rpc {
 
 namespace internal {
 
-inline std::unordered_map<uint32_t,
-                          std::function<std::pair<std::errc, std::vector<char>>(
-                              std::string_view, rpc_conn &)>>
+inline std::unordered_map<
+    uint32_t, std::function<std::pair<std::errc, std::vector<char>>(
+                  std::string_view, rpc_conn &, SerializeType serialize_type)>>
     g_handlers;
 inline std::unordered_map<
     uint32_t, std::function<async_simple::coro::Lazy<std::pair<
@@ -62,10 +63,20 @@ inline auto pack_result(void) {
                                                            std::monostate{}));
 }
 
-inline std::function<std::pair<std::errc, std::vector<char>>(std::string_view,
-                                                             rpc_conn &)>
+inline std::function<std::pair<std::errc, std::vector<char>>(
+    std::string_view, rpc_conn &, SerializeType serialize_type)>
     *get_handler(std::string_view data) {
   uint32_t id = *(uint32_t *)data.data();
+  auto it = g_handlers.find(id);
+  if (it != g_handlers.end()) {
+    return &it->second;
+  }
+  return nullptr;
+}
+
+inline std::function<std::pair<std::errc, std::vector<char>>(
+    std::string_view, rpc_conn &, SerializeType serialize_type)>
+    *get_handler(uint32_t id) {
   auto it = g_handlers.find(id);
   if (it != g_handlers.end()) {
     return &it->second;
@@ -112,10 +123,38 @@ route_coro(auto handler, std::string_view data, rpc_conn conn) {
                           "the function not found");
   }
 }
+inline std::pair<std::errc, std::vector<char>> route(
+    auto handler, uint32_t id, std::string_view data, rpc_conn conn,
+    SerializeType serialize_type) {
+  if (handler) [[likely]] {
+    try {
+#ifndef NDEBUG
+      if (auto it = internal::g_id2name.find(id);
+          it != internal::g_id2name.end()) {
+        easylog::info("route function name {}", it->second);
+      }
+#endif
+      return (*handler)(data, conn, serialize_type);
+    } catch (const std::exception &e) {
+      easylog::error("the rpc function has exception {}, function id {}",
+                     e.what(), id);
+      return pack_result(std::errc::interrupted, e.what());
+    } catch (...) {
+      easylog::error("the rpc function has unknown exception, function id {}",
+                     id);
+      return pack_result(std::errc::interrupted, "unknown exception");
+    }
+  }
+  else [[unlikely]] {
+    easylog::error("the rpc function not found, function id {}", id);
+    return pack_result(std::errc::function_not_supported,
+                       "the function not found");
+  }
+}
 
-inline std::pair<std::errc, std::vector<char>> route(auto handler,
-                                                     std::string_view data,
-                                                     rpc_conn conn) {
+inline std::pair<std::errc, std::vector<char>> route(
+    auto handler, std::string_view data, rpc_conn conn,
+    SerializeType serialize_type) {
   uint32_t id = *(uint32_t *)data.data();
   if (handler) [[likely]] {
     try {
@@ -125,7 +164,7 @@ inline std::pair<std::errc, std::vector<char>> route(auto handler,
         easylog::info("route function name {}", it->second);
       }
 #endif
-      return (*handler)(data, conn);
+      return (*handler)(data, conn, serialize_type);
     } catch (const std::exception &e) {
       easylog::error("the rpc function has exception {}, function id {}",
                      e.what(), id);
@@ -159,7 +198,8 @@ auto get_return_type() {
   }
 }
 
-template <auto func, typename Self = void>
+template <auto func, SerializeType serialize_type = SerializeType::STRUCT_PACK,
+          typename Self = void>
 inline auto execute(std::string_view data, rpc_conn &conn,
                     Self *self = nullptr) {
   using T = decltype(func);
@@ -184,13 +224,37 @@ inline auto execute(std::string_view data, rpc_conn &conn,
     struct_pack::errc err{};
     constexpr size_t size = std::tuple_size_v<decltype(args)>;
     if constexpr (size > 0) {
-      data = data.substr(FUNCTION_ID_LEN);
-      if constexpr (size == 1) {
-        err = struct_pack::deserialize_to(std::get<0>(args), data.data(),
-                                          data.size());
+      if constexpr (serialize_type == SerializeType::STRUCT_PACK) {
+        data = data.substr(FUNCTION_ID_LEN);
+        if constexpr (size == 1) {
+          err = struct_pack::deserialize_to(std::get<0>(args), data.data(),
+                                            data.size());
+        }
+        else {
+          err = struct_pack::deserialize_to(args, data.data(), data.size());
+        }
       }
       else {
-        err = struct_pack::deserialize_to(args, data.data(), data.size());
+        if constexpr (size == 1) {
+          msgpack::unpacked unpacked;
+          msgpack::unpack(unpacked, data.data(), data.size());
+          using args_type = decltype(args);
+          using arg_type = std::tuple_element_t<0, args_type>;
+          std::get<0>(args) = unpacked.get().as<arg_type>();
+        }
+        else {
+          msgpack::unpacked unpacked;
+          msgpack::unpack(unpacked, data.data(), data.size());
+          args = unpacked.get().as<decltype(args)>();
+        }
+
+        msgpack::sbuffer sbuf;
+        auto ret = std::apply(func, args);
+        msgpack::pack(sbuf, std::forward_as_tuple(0, ret));
+        std::vector<char> v;
+        v.resize(16 + sbuf.size());
+        std::memcpy(v.data() + 16, sbuf.data(), sbuf.size());
+        return std::make_pair(std::errc{}, std::move(v));
       }
     }
 

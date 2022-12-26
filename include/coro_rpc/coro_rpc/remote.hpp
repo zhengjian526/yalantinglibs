@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "coro_rpc/coro_rpc/router.hpp"
 #include "router_impl.hpp"
 #include "util/utils.hpp"
 /*! \file remote.hpp
@@ -45,8 +46,16 @@ inline void register_one_handler(Self *self) {
   }
   else {
     auto it = internal::g_handlers.emplace(
-        id, [self](std::string_view data, rpc_conn conn) mutable {
-          return internal::execute<func>(data, conn, self);
+        id, [self](std::string_view data, rpc_conn conn,
+                   SerializeType serialize_type) mutable {
+          if (serialize_type == SerializeType::STRUCT_PACK) {
+            return internal::execute<func, SerializeType::STRUCT_PACK>(
+                data, conn, self);
+          }
+          else {
+            return internal::execute<func, SerializeType::MSGPACK>(data, conn,
+                                                                   self);
+          }
         });
     if (!it.second) {
       easylog::critical("duplication function {} register!", name);
@@ -79,8 +88,14 @@ inline void register_one_handler() {
   }
   else {
     auto it = internal::g_handlers.emplace(
-        id, [](std::string_view data, rpc_conn conn) mutable {
-          return internal::execute<func>(data, conn);
+        id, [](std::string_view data, rpc_conn conn,
+               SerializeType serialize_type) mutable {
+          if (serialize_type == SerializeType::STRUCT_PACK) {
+            return internal::execute<func>(data, conn);
+          }
+          else {
+            return internal::execute<func, SerializeType::MSGPACK>(data, conn);
+          }
         });
     if (!it.second) {
       easylog::critical("duplication function {} register!", name);

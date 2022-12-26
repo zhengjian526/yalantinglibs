@@ -4,6 +4,9 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 # After CMake 3.15, all dependencies handled automatically when linking CMake target
 # No other code needed
 #########################################################################################
+include_directories(msgpack-cxx-4.1.2/include)
+add_definitions(-DMSGPACK_NO_BOOST=ON)
+
 add_executable(helloworld_server
         server/main.cpp
         server/rpc_service.cpp

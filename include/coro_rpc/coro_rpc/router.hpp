@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#pragma once
 #include <memory>
 #include <variant>
 #include <vector>
@@ -23,16 +24,28 @@ class async_connection;
 class coro_connection;
 using rpc_conn = std::variant<std::shared_ptr<async_connection>,
                               std::shared_ptr<coro_connection>>;
+enum class SerializeType {
+  STRUCT_PACK,
+  MSGPACK,
+};
 namespace internal {
-std::pair<std::errc, std::vector<char>> route(auto handler,
-                                              std::string_view data,
-                                              rpc_conn conn);
+std::pair<std::errc, std::vector<char>> route(
+    auto handler, uint32_t id, std::string_view data, rpc_conn conn,
+    SerializeType serialize_type = SerializeType::STRUCT_PACK);
+
+std::pair<std::errc, std::vector<char>> route(
+    auto handler, std::string_view data, rpc_conn conn,
+    SerializeType serialize_type = SerializeType::STRUCT_PACK);
 async_simple::coro::Lazy<std::pair<std::errc, std::vector<char>>> route_coro(
     auto handler, std::string_view data, rpc_conn conn);
 
-std::function<std::pair<std::errc, std::vector<char>>(std::string_view,
-                                                      rpc_conn &)>
+std::function<std::pair<std::errc, std::vector<char>>(
+    std::string_view, rpc_conn &, SerializeType serialize_type)>
     *get_handler(std::string_view data);
+
+std::function<std::pair<std::errc, std::vector<char>>(
+    std::string_view, rpc_conn &, SerializeType serialize_type)>
+    *get_handler(uint32_t id);
 
 std::function<async_simple::coro::Lazy<std::pair<std::errc, std::vector<char>>>(
     std::string_view, rpc_conn &)>

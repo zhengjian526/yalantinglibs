@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <msgpack.hpp>
 #include <system_error>
 #include <utility>
 #include <variant>
@@ -35,6 +36,17 @@
 #ifdef UNIT_TEST_INJECT
 #include "inject_action.hpp"
 #endif
+
+namespace rest_rpc {
+enum class request_type : uint8_t { req_res, sub_pub };
+struct rpc_header {
+  uint8_t magic;
+  request_type req_type;
+  uint32_t body_len;
+  uint64_t req_id;
+};
+}  // namespace rest_rpc
+
 namespace coro_rpc {
 /*!
  * TODO: add doc
@@ -114,118 +126,160 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
   template <typename Socket>
   async_simple::coro::Lazy<void> start_impl(Socket &socket) noexcept {
     char head_[RPC_HEAD_LEN];
-    rpc_header header{};
+
     auto self = shared_from_this();
     while (true) {
       reset_timer();
       auto ret = co_await asio_util::async_read(
           socket, asio::buffer(head_, RPC_HEAD_LEN));
-      cancel_timer();
-      // `co_await async_read` uses asio::async_read underlying.
-      // If eof occurred, the bytes_transferred of `co_await async_read` must
-      // less than RPC_HEAD_LEN. Incomplete data will be discarded.
-      // So, no special handling of eof is required.
-      if (ret.first) {
-        log((std::errc)ret.first.value());
-        co_await close();
-        co_return;
-      }
-      assert(ret.second == RPC_HEAD_LEN);
-      auto errc = struct_pack::deserialize_to(header, head_, RPC_HEAD_LEN);
-      if (errc != struct_pack::errc::ok) [[unlikely]] {
-        log(std::errc::protocol_error);
-        co_await close();
-        co_return;
-      }
-
-#ifdef UNIT_TEST_INJECT
-      client_id_ = header.seq_num;
-      easylog::info("conn_id {}, client_id {}", conn_id_, client_id_);
-#endif
-
-#ifdef UNIT_TEST_INJECT
-      if (g_action == inject_action::close_socket_after_read_header) {
-        easylog::warn(
-            "inject action: close_socket_after_read_header, conn_id {}, "
-            "client_id {}",
-            conn_id_, client_id_);
-        co_await close();
-        co_return;
-      }
-#endif
-      if (header.magic != magic_number) [[unlikely]] {
-        easylog::error("bad magic number, conn_id {}", conn_id_);
-        co_await close();
-        co_return;
-      }
-      if (header.length == 0) [[unlikely]] {
-        easylog::info("bad length:{}, conn_id {}", header.length, conn_id_);
-        co_await close();
-        co_return;
-      }
-
-      if (header.length > body_size_) {
-        body_size_ = header.length;
-        body_.resize(body_size_);
-      }
-
-      ret = co_await asio_util::async_read(
-          socket, asio::buffer(body_.data(), header.length));
-      if (ret.first) [[unlikely]] {
-        easylog::info("read error:{}, conn_id {}", ret.first.message(),
-                      conn_id_);
-        co_await close();
-        co_return;
-      }
-
+      uint8_t magic = *(uint8_t *)head_;
       std::pair<std::errc, std::vector<char>> pair{};
-      auto handler = internal::get_handler({body_.data(), ret.second});
-      if (!handler) {
-        auto coro_handler =
-            internal::get_coro_handler({body_.data(), ret.second});
-        pair = co_await internal::route_coro(coro_handler,
-                                             {body_.data(), ret.second}, self);
-      }
-      else {
-        pair = internal::route(handler, {body_.data(), ret.second}, self);
-      }
-
-      auto &[err, buf] = pair;
-      if (delay_) {
-        delay_ = false;
-        continue;
-      }
-      *((uint32_t *)buf.data()) = buf.size() - RESPONSE_HEADER_LEN;
-#ifdef UNIT_TEST_INJECT
-      if (g_action == inject_action::close_socket_after_send_length) {
-        easylog::warn(
-            "inject action: close_socket_after_send_length conn_id {}, "
-            "client_id {}",
-            conn_id_, client_id_);
-        co_await asio_util::async_write(
-            socket, asio::buffer(buf.data(), RESPONSE_HEADER_LEN));
-        co_await close();
-        co_return;
-      }
-      if (g_action == inject_action::server_send_bad_rpc_result) {
-        easylog::warn(
-            "inject action: server_send_bad_rpc_result conn_id {}, client_id "
-            "{}",
-            conn_id_, client_id_);
-        buf[RESPONSE_HEADER_LEN + 1] = (buf[RESPONSE_HEADER_LEN + 1] + 1);
-      }
-#endif
-      if (rsp_err_ == err_ok) [[likely]] {
-        if (err != err_ok) [[unlikely]] {
-          rsp_err_ = err;
+      if (magic == 39) {
+        rest_rpc::rpc_header *header = (rest_rpc::rpc_header *)head_;
+        auto body_len = header->body_len;
+        ret = co_await asio_util::async_read(
+            socket, asio::buffer(body_.data(), body_len));
+        if (ret.first) [[unlikely]] {
+          easylog::info("read error:{}, conn_id {}", ret.first.message(),
+                        conn_id_);
+          co_await close();
+          co_return;
         }
-        write_queue_.push_back(std::move(buf));
+
+        auto beg = body_.data() + 2;
+        auto ptr = beg;
+        while (true) {
+          if (*ptr < 0) {
+            break;
+          }
+
+          ptr++;
+        }
+        size_t n = ptr - beg;
+        std::string_view func_name(beg, n);
+        auto id = struct_pack::MD5::MD5Hash32Constexpr(func_name.data(),
+                                                       func_name.length());
+        auto handler = internal::get_handler(id);
+        pair = internal::route(handler, id, {ptr, body_len - n - 2}, self,
+                               SerializeType::MSGPACK);
+        uint32_t body_size = pair.second.size() - 16;
+        rest_rpc::rpc_header resp_header{header->magic, header->req_type,
+                                         body_size, header->req_id};
+        std::memcpy(pair.second.data(), &resp_header, 16);
+        write_queue_.push_back(std::move(pair.second));
         if (write_queue_.size() == 1) {
           send_data().start([ec = shared_from_this()](auto &&) {
           });
         }
-        if (err != err_ok) [[unlikely]] {
+      }
+      else if (magic == magic_number) {
+        rpc_header header{};
+        cancel_timer();
+        // `co_await async_read` uses asio::async_read underlying.
+        // If eof occurred, the bytes_transferred of `co_await async_read` must
+        // less than RPC_HEAD_LEN. Incomplete data will be discarded.
+        // So, no special handling of eof is required.
+        if (ret.first) {
+          log((std::errc)ret.first.value());
+          co_await close();
           co_return;
+        }
+        assert(ret.second == RPC_HEAD_LEN);
+        auto errc = struct_pack::deserialize_to(header, head_, RPC_HEAD_LEN);
+        if (errc != struct_pack::errc::ok) [[unlikely]] {
+          log(std::errc::protocol_error);
+          co_await close();
+          co_return;
+        }
+
+#ifdef UNIT_TEST_INJECT
+        client_id_ = header.seq_num;
+        easylog::info("conn_id {}, client_id {}", conn_id_, client_id_);
+#endif
+
+#ifdef UNIT_TEST_INJECT
+        if (g_action == inject_action::close_socket_after_read_header) {
+          easylog::warn(
+              "inject action: close_socket_after_read_header, conn_id {}, "
+              "client_id {}",
+              conn_id_, client_id_);
+          co_await close();
+          co_return;
+        }
+#endif
+        if (header.magic != magic_number) [[unlikely]] {
+          easylog::error("bad magic number, conn_id {}", conn_id_);
+          co_await close();
+          co_return;
+        }
+        if (header.length == 0) [[unlikely]] {
+          easylog::info("bad length:{}, conn_id {}", header.length, conn_id_);
+          co_await close();
+          co_return;
+        }
+
+        if (header.length > body_size_) {
+          body_size_ = header.length;
+          body_.resize(body_size_);
+        }
+
+        ret = co_await asio_util::async_read(
+            socket, asio::buffer(body_.data(), header.length));
+        if (ret.first) [[unlikely]] {
+          easylog::info("read error:{}, conn_id {}", ret.first.message(),
+                        conn_id_);
+          co_await close();
+          co_return;
+        }
+
+        auto handler = internal::get_handler({body_.data(), ret.second});
+        if (!handler) {
+          auto coro_handler =
+              internal::get_coro_handler({body_.data(), ret.second});
+          pair = co_await internal::route_coro(
+              coro_handler, {body_.data(), ret.second}, self);
+        }
+        else {
+          pair = internal::route(handler, {body_.data(), ret.second}, self);
+        }
+
+        auto &[err, buf] = pair;
+        if (delay_) {
+          delay_ = false;
+          continue;
+        }
+        *((uint32_t *)buf.data()) = buf.size() - RESPONSE_HEADER_LEN;
+#ifdef UNIT_TEST_INJECT
+        if (g_action == inject_action::close_socket_after_send_length) {
+          easylog::warn(
+              "inject action: close_socket_after_send_length conn_id {}, "
+              "client_id {}",
+              conn_id_, client_id_);
+          co_await asio_util::async_write(
+              socket, asio::buffer(buf.data(), RESPONSE_HEADER_LEN));
+          co_await close();
+          co_return;
+        }
+        if (g_action == inject_action::server_send_bad_rpc_result) {
+          easylog::warn(
+              "inject action: server_send_bad_rpc_result conn_id {}, client_id "
+              "{}",
+              conn_id_, client_id_);
+          buf[RESPONSE_HEADER_LEN + 1] = (buf[RESPONSE_HEADER_LEN + 1] + 1);
+        }
+#endif
+        if (rsp_err_ == err_ok) [[likely]] {
+          if (err != err_ok) [[unlikely]] {
+            rsp_err_ = err;
+          }
+          write_queue_.push_back(std::move(buf));
+          if (write_queue_.size() == 1) {
+            send_data().start([ec = shared_from_this()](auto &&) {
+            });
+          }
+          if (err != err_ok) [[unlikely]] {
+            co_return;
+          }
         }
       }
     }
